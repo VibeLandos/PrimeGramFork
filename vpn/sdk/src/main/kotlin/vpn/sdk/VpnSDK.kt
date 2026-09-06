@@ -36,6 +36,21 @@ object VpnSDK {
 
     private const val TAG = "VpnSDK"
 
+    /** TCP connect to the share-link host:port. Fast, does not touch libxray. */
+    const val DELAY_TCP = 0
+    /** TLS handshake to host:port. Still no xray; useful when the port is open but not a raw TCP service. */
+    const val DELAY_TLS = 1
+    /**
+     * HTTP GET of a generate_204 URL *through* the node's local SOCKS inbound.
+     * This is the Happ/v2rayNG-style URL test: it proves the key actually tunnels traffic,
+     * not merely that the port is reachable. Sequential, and briefly swaps the running
+     * xray config (then restores it).
+     */
+    const val DELAY_HTTP = 2
+
+    private const val HTTP_PROBE_URL = "https://www.gstatic.com/generate_204"
+    private val proxyControlLock = Any()
+
     fun interface StateListener {
         fun onStateChanged(state: VpnTunnelState)
     }
@@ -293,15 +308,17 @@ object VpnSDK {
                 }
                 if (!XrayProxy.refreshHealth()) {
                     VpnSDK.logW(TAG, "Watchdog: xray unhealthy, restarting from cached config")
-                    val cached = VpnNetworkFactory.getRegistrationRepository().getCachedConfigJson()
-                    if (cached != null) {
-                        XrayProxy.stop()
-                        if (!XrayProxy.start(cached)) {
-                            VpnSDK.logE(TAG, "Watchdog: restart failed: ${XrayProxy.lastError}")
+                    synchronized(proxyControlLock) {
+                        val cached = VpnNetworkFactory.getRegistrationRepository().getCachedConfigJson()
+                        if (cached != null) {
+                            XrayProxy.stop()
+                            if (!XrayProxy.start(cached)) {
+                                VpnSDK.logE(TAG, "Watchdog: restart failed: ${XrayProxy.lastError}")
+                            }
+                        } else {
+                            VpnSDK.logW(TAG, "Watchdog: no cached config to restart from, stopping watchdog")
+                            break
                         }
-                    } else {
-                        VpnSDK.logW(TAG, "Watchdog: no cached config to restart from, stopping watchdog")
-                        break
                     }
                 }
             }
@@ -356,25 +373,205 @@ object VpnSDK {
     @JvmStatic
     fun setCustomVlessConfig(serverUrl: String): Boolean {
         checkInitialized()
-        val json = when {
-            serverUrl.startsWith("vless://") -> parseVlessUrlToJson(serverUrl)
-            serverUrl.startsWith("vmess://") -> parseVmessUrlToJson(serverUrl)
-            serverUrl.startsWith("trojan://") -> parseTrojanUrlToJson(serverUrl)
-            serverUrl.startsWith("ss://") -> parseShadowsocksUrlToJson(serverUrl)
-            serverUrl.startsWith("socks://") -> parseSocksUrlToJson(serverUrl)
+        synchronized(proxyControlLock) {
+            val json = shareLinkToJson(serverUrl)
+            if (json == null) {
+                lastCustomVlessError = "invalid_url"
+                return false
+            }
+            VpnNetworkFactory.getRegistrationRepository().setCustomConfigJson(json)
+            if (isProxyRunning()) {
+                stopProxy()
+            }
+            val ok = startProxy()
+            lastCustomVlessError = if (ok) null else (XrayProxy.lastError ?: "connect_failed")
+            return ok
+        }
+    }
+
+    private fun lowercaseScheme(url: String): String {
+        val idx = url.indexOf("://")
+        if (idx <= 0) return url
+        return url.substring(0, idx).lowercase() + url.substring(idx)
+    }
+
+    private fun shareLinkToJson(serverUrl: String): String? {
+        val url = lowercaseScheme(serverUrl.trim())
+        return when {
+            url.startsWith("vless://") -> parseVlessUrlToJson(url)
+            url.startsWith("vmess://") -> parseVmessUrlToJson(url)
+            url.startsWith("trojan://") -> parseTrojanUrlToJson(url)
+            url.startsWith("ss://") -> parseShadowsocksUrlToJson(url)
+            url.startsWith("socks://") -> parseSocksUrlToJson(url)
             else -> null
         }
-        if (json == null) {
-            lastCustomVlessError = "invalid_url"
-            return false
+    }
+
+    /**
+     * Delay in ms for one share link. `-1` means the link could not be parsed,
+     * `-2` means the probe failed or timed out. Must not be called on the main thread
+     * for [DELAY_HTTP] (it starts xray).
+     */
+    @JvmStatic
+    fun measureShareLinkDelay(shareUrl: String, mode: Int, timeoutMs: Int): Long {
+        return when (mode) {
+            DELAY_TLS -> measureTlsDelay(shareUrl, timeoutMs)
+            DELAY_HTTP -> {
+                checkInitialized()
+                measureHttpGetDelay(shareUrl, timeoutMs)
+            }
+            else -> measureTcpDelay(shareUrl, timeoutMs)
         }
-        VpnNetworkFactory.getRegistrationRepository().setCustomConfigJson(json)
-        if (isProxyRunning()) {
-            stopProxy()
+    }
+
+    /** Same as [measureShareLinkDelay] for many URLs. HTTP mode holds the xray lock once and restores the previous config at the end. */
+    @JvmStatic
+    fun measureShareLinkDelays(shareUrls: Array<String>, mode: Int, timeoutMs: Int): LongArray {
+        if (mode != DELAY_HTTP) {
+            return LongArray(shareUrls.size) { i -> measureShareLinkDelay(shareUrls[i], mode, timeoutMs) }
         }
-        val ok = startProxy()
-        lastCustomVlessError = if (ok) null else (XrayProxy.lastError ?: "connect_failed")
-        return ok
+        checkInitialized()
+        val results = LongArray(shareUrls.size) { -2 }
+        synchronized(proxyControlLock) {
+            val previous = VpnNetworkFactory.getRegistrationRepository().getCachedConfigJson()
+            val wasRunning = XrayProxy.isStartedLocally()
+            stopProxyWatchdog()
+            try {
+                for (i in shareUrls.indices) {
+                    results[i] = probeHttpGetUnlocked(shareUrls[i], timeoutMs)
+                }
+            } finally {
+                restoreXrayAfterProbe(previous, wasRunning)
+            }
+        }
+        return results
+    }
+
+    private fun measureTcpDelay(shareUrl: String, timeoutMs: Int): Long {
+        val hostPort = extractHostPort(shareUrl) ?: return -1
+        val start = android.os.SystemClock.elapsedRealtime()
+        return try {
+            java.net.Socket().use { socket ->
+                socket.connect(java.net.InetSocketAddress(stripBrackets(hostPort.host), hostPort.port), timeoutMs)
+            }
+            android.os.SystemClock.elapsedRealtime() - start
+        } catch (t: Throwable) {
+            -2
+        }
+    }
+
+    private fun measureTlsDelay(shareUrl: String, timeoutMs: Int): Long {
+        val hostPort = extractHostPort(shareUrl) ?: return -1
+        val host = stripBrackets(hostPort.host)
+        val start = android.os.SystemClock.elapsedRealtime()
+        return try {
+            val factory = permissiveSslSocketFactory()
+            (factory.createSocket() as javax.net.ssl.SSLSocket).use { socket ->
+                socket.soTimeout = timeoutMs
+                socket.connect(java.net.InetSocketAddress(host, hostPort.port), timeoutMs)
+                socket.startHandshake()
+            }
+            android.os.SystemClock.elapsedRealtime() - start
+        } catch (t: Throwable) {
+            -2
+        }
+    }
+
+    private fun measureHttpGetDelay(shareUrl: String, timeoutMs: Int): Long {
+        synchronized(proxyControlLock) {
+            val previous = VpnNetworkFactory.getRegistrationRepository().getCachedConfigJson()
+            val wasRunning = XrayProxy.isStartedLocally()
+            stopProxyWatchdog()
+            try {
+                return probeHttpGetUnlocked(shareUrl, timeoutMs)
+            } finally {
+                restoreXrayAfterProbe(previous, wasRunning)
+            }
+        }
+    }
+
+    private fun probeHttpGetUnlocked(shareUrl: String, timeoutMs: Int): Long {
+        val json = shareLinkToJson(shareUrl) ?: return -1
+        try {
+            if (XrayProxy.isRunning()) {
+                XrayProxy.stop()
+            }
+            if (!XrayProxy.start(json)) {
+                return -2
+            }
+            val deadline = android.os.SystemClock.elapsedRealtime() + 800
+            while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                if (XrayProxy.isHealthy(150)) break
+                Thread.sleep(50)
+            }
+            return httpGetViaSocks(timeoutMs)
+        } catch (t: Throwable) {
+            logE(TAG, "HTTP GET probe failed", t)
+            return -2
+        }
+    }
+
+    private fun restoreXrayAfterProbe(previousJson: String?, wasRunning: Boolean) {
+        try {
+            if (XrayProxy.isRunning()) {
+                XrayProxy.stop()
+            }
+        } catch (ignored: Throwable) {
+        }
+        if (previousJson != null && wasRunning) {
+            if (XrayProxy.start(previousJson)) {
+                startProxyWatchdog()
+            }
+        }
+    }
+
+    private fun httpGetViaSocks(timeoutMs: Int): Long {
+        val https = httpGetViaSocksUrl(HTTP_PROBE_URL, timeoutMs)
+        if (https >= 0) {
+            return https
+        }
+        return httpGetViaSocksUrl("http://www.gstatic.com/generate_204", timeoutMs)
+    }
+
+    private fun httpGetViaSocksUrl(probeUrl: String, timeoutMs: Int): Long {
+        val start = android.os.SystemClock.elapsedRealtime()
+        val proxy = java.net.Proxy(
+            java.net.Proxy.Type.SOCKS,
+            java.net.InetSocketAddress(XrayProxy.socksHost, XrayProxy.socksPort),
+        )
+        var conn: java.net.HttpURLConnection? = null
+        return try {
+            conn = java.net.URL(probeUrl).openConnection(proxy) as java.net.HttpURLConnection
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
+            conn.instanceFollowRedirects = false
+            conn.requestMethod = "GET"
+            val code = conn.responseCode
+            if (code == 204 || code == 200 || code == 301 || code == 302) {
+                android.os.SystemClock.elapsedRealtime() - start
+            } else {
+                -2
+            }
+        } catch (t: Throwable) {
+            -2
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun stripBrackets(host: String): String {
+        return if (host.startsWith("[") && host.endsWith("]")) host.substring(1, host.length - 1) else host
+    }
+
+    private fun permissiveSslSocketFactory(): javax.net.ssl.SSLSocketFactory {
+        val trustAll = arrayOf<javax.net.ssl.TrustManager>(object : javax.net.ssl.X509TrustManager {
+            override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+            override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = emptyArray()
+        })
+        val ctx = javax.net.ssl.SSLContext.getInstance("TLS")
+        ctx.init(null, trustAll, java.security.SecureRandom())
+        return ctx.socketFactory
     }
 
     /** The one bit every protocol's config shares - a local SOCKS5 inbound at the fixed port the
@@ -722,10 +919,11 @@ object VpnSDK {
     @JvmStatic
     fun extractHostPort(url: String): vpn.sdk.HostPort? {
         return try {
+            val normalized = lowercaseScheme(url.trim())
             when {
-                url.startsWith("vless://") || url.startsWith("trojan://") -> {
-                    val scheme = if (url.startsWith("vless://")) "vless://" else "trojan://"
-                    val withoutScheme = url.substring(scheme.length)
+                normalized.startsWith("vless://") || normalized.startsWith("trojan://") -> {
+                    val scheme = if (normalized.startsWith("vless://")) "vless://" else "trojan://"
+                    val withoutScheme = normalized.substring(scheme.length)
                     val atIndex = withoutScheme.lastIndexOf('@')
                     if (atIndex == -1) return null
                     val hostPortRest = withoutScheme.substring(atIndex + 1)
@@ -736,14 +934,14 @@ object VpnSDK {
                     val port = hostPort.substring(colonIndex + 1).toIntOrNull() ?: return null
                     vpn.sdk.HostPort(hostPort.substring(0, colonIndex), port)
                 }
-                url.startsWith("vmess://") -> {
-                    val payload = url.substring("vmess://".length).substringBefore('#')
+                normalized.startsWith("vmess://") -> {
+                    val payload = normalized.substring("vmess://".length).substringBefore('#')
                     val decoded = String(android.util.Base64.decode(payload, android.util.Base64.DEFAULT))
                     val obj = org.json.JSONObject(decoded)
                     vpn.sdk.HostPort(obj.getString("add"), obj.getInt("port"))
                 }
-                url.startsWith("ss://") -> {
-                    val withoutScheme = url.substring("ss://".length).substringBefore('#')
+                normalized.startsWith("ss://") -> {
+                    val withoutScheme = normalized.substring("ss://".length).substringBefore('#')
                     val atIndex = withoutScheme.lastIndexOf('@')
                     val hostPort = if (atIndex != -1) {
                         withoutScheme.substring(atIndex + 1).substringBefore('?')
@@ -756,8 +954,8 @@ object VpnSDK {
                     val port = hostPort.substring(colonIndex + 1).toIntOrNull() ?: return null
                     vpn.sdk.HostPort(hostPort.substring(0, colonIndex), port)
                 }
-                url.startsWith("socks://") -> {
-                    val withoutScheme = url.substring("socks://".length).substringBefore('#')
+                normalized.startsWith("socks://") -> {
+                    val withoutScheme = normalized.substring("socks://".length).substringBefore('#')
                     val atIndex = withoutScheme.lastIndexOf('@')
                     val hostPort = if (atIndex != -1) withoutScheme.substring(atIndex + 1) else withoutScheme
                     val colonIndex = hostPort.lastIndexOf(':')

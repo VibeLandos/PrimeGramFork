@@ -195,4 +195,21 @@ android {
 
 apply plugin: 'com.google.gms.google-services'
 
+// Optimized install+launch on a USB/wifi device. `afatRelease` stays debuggable (Play Protect
+// sideload), so ART would still skip JIT; `standalone` is minify + debuggable false.
+tasks.register("runDeviceStandalone") {
+    group = "install"
+    description = "Install afatStandalone on a connected phone and launch it"
+    dependsOn "installAfatStandalone"
+    doLast {
+        def isWindows = System.getProperty("os.name").toLowerCase().contains("windows")
+        def adbName = isWindows ? "adb.exe" : "adb"
+        def adb = new File(android.sdkDirectory, "platform-tools/${adbName}")
+        exec {
+            commandLine adb.absolutePath, "shell", "monkey", "-p", APP_PACKAGE,
+                    "-c", "android.intent.category.LAUNCHER", "1"
+        }
+    }
+}
+
 

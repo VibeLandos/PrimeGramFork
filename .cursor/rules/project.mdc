@@ -1,0 +1,24 @@
+---
+description: Что это за проект, где карта репозитория, как в нём ориентироваться
+alwaysApply: true
+---
+
+# PrimeGramFork
+
+Это **не** официальный Telegram. Это форк Android-клиента **PrimeGram** (GPLv2) в org `VibeLandos`, репозиторий [VibeLandos/PrimeGramFork](https://github.com/VibeLandos/PrimeGramFork). Upstream: [Primeevokak/PrimeGram](https://github.com/Primeevokak/PrimeGram), ветка `dev`. Пакет: `org.telegram.messenger.prime`.
+
+Клиент Telegram с модификациями: устойчивое соединение (TgWs / Cloudflare / VPN-слой), файлы до 8 ГБ, локальная расшифровка голосовых (Whisper), Python-плагины совместимые с exteraGram, встроенный браузер, лента каналов, «серая зона» (ghost / save deleted — всё opt-in).
+
+## Карта проекта и changelog
+
+Полная карта модулей, пакетов и точек входа: **`.cursor/PROJECT_MAP.md`**. Читай её перед навигацией по коду, поиском «куда править» и перед сборкой. Не держи в голове дерево целиком — сверяйся с картой.
+
+Журнал правок форка: **`CHANGELOG.md`**. Любая задача, которая меняет продукт, сразу дописывается в секцию `Unreleased` (правило `.cursor/rules/changelog.mdc`).
+
+## Как работать здесь
+
+- Правки форка почти всегда в классах `Prime*` / `GreyZone*` / `TgWs*`, не в ядре Telegram без нужды.
+- Собирать модуль `:TMessagesProj_AppStandalone` (flavor `afat`). Локально NDK собирает только `arm64-v8a`.
+- Ключи API: `PRIME_APP_ID` / `PRIME_APP_HASH` (env или `local.properties`). В git — публичная запасная пара Telegram Web, не боевые ключи форка.
+- `local.properties` и чужой `google-services.json` не коммитить. Пуши без своего Firebase не заработают.
+- Плагины: Java-движок в `messenger/plugins`, Python SDK в `TMessagesProj/src/main/python`. Chaquopy вешается только на `TMessagesProj`.
